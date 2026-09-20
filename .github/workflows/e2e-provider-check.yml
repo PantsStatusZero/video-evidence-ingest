@@ -2,11 +2,12 @@ name: e2e-provider-check
 run-name: e2e-provider-check
 
 on:
-  push:
-    branches:
-      - bootstrap-e2e
-    paths:
-      - '.github/workflows/e2e-provider-check.yml'
+  workflow_dispatch:
+    inputs:
+      job_ref:
+        description: Opaque test job reference
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -27,14 +28,14 @@ jobs:
         id: job
         shell: bash
         env:
-          TEST_JOB_REF: 0b62010710881693074f62ae6220336c
+          DISPATCH_JOB_REF: ${{ inputs.job_ref }}
         run: |
           set -euo pipefail
-          if ! printf '%s' "$TEST_JOB_REF" | grep -Eq '^[a-f0-9]{32}$'; then
+          if ! printf '%s' "$DISPATCH_JOB_REF" | grep -Eq '^[a-f0-9]{32}$'; then
             echo 'invalid opaque job reference'
             exit 2
           fi
-          printf 'job_ref=%s\n' "$TEST_JOB_REF" >> "$GITHUB_OUTPUT"
+          printf 'job_ref=%s\n' "$DISPATCH_JOB_REF" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
