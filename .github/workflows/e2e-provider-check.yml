@@ -1,0 +1,185 @@
+name: e2e-provider-check
+run-name: e2e-provider-check
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_ref:
+        description: Opaque test job reference
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+  e2e:
+    environment: e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Resolve opaque job reference
+        id: job
+        shell: bash
+        env:
+          DISPATCH_JOB_REF: ${{ inputs.job_ref }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$DISPATCH_JOB_REF" | grep -Eq '^[a-f0-9]{32}$'; then
+            echo 'invalid opaque job reference'
+            exit 2
+          fi
+          printf 'job_ref=%s\n' "$DISPATCH_JOB_REF" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Install runtime dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg tesseract-ocr
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet -e . \
+            'yt-dlp[default]==2026.8.19' \
+            'bgutil-ytdlp-pot-provider==2.0.0' \
+            'faster-whisper==1.2.1'
+
+      - name: Prepare pinned provider support
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --quiet --filter=blob:none --no-checkout \
+            https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git \
+            "$RUNNER_TEMP/pot-provider"
+          cd "$RUNNER_TEMP/pot-provider"
+          git checkout --quiet 37169ee2656e08c5c2e5dc9df4c598c0cb4c88a8
+          cd server
+          npm ci --silent
+          npx tsc
+
+      - name: Open isolated private job branch
+        id: mailbox
+        shell: bash
+        env:
+          JOB_REF: ${{ steps.job.outputs.job_ref }}
+          MAILBOX_DEPLOY_KEY: ${{ secrets.MAILBOX_DEPLOY_KEY }}
+          MAILBOX_SSH_URL: ${{ secrets.MAILBOX_SSH_URL }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          key="$RUNNER_TEMP/mailbox_key"
+          known="$RUNNER_TEMP/known_hosts"
+          printf '%s\n' "$MAILBOX_DEPLOY_KEY" > "$key"
+          chmod 600 "$key"
+          cat > "$known" <<'KNOWN_HOSTS'
+          github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+          github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+          KNOWN_HOSTS
+          chmod 600 "$known"
+          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o UserKnownHostsFile=$known -o StrictHostKeyChecking=yes"
+          if ! git clone --quiet --single-branch --branch "job/$JOB_REF" \
+            "$MAILBOX_SSH_URL" "$RUNNER_TEMP/mailbox" \
+            >"$RUNNER_TEMP/mailbox-clone.log" 2>&1; then
+            echo 'isolated job store unavailable'
+            exit 1
+          fi
+          test -f "$RUNNER_TEMP/mailbox/request.p7m.b64"
+
+      - name: Decrypt and validate job envelope
+        shell: bash
+        env:
+          JOB_REF: ${{ steps.job.outputs.job_ref }}
+          JOB_DECRYPTION_PRIVATE_KEY: ${{ secrets.JOB_DECRYPTION_PRIVATE_KEY }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          private="$RUNNER_TEMP/job_key.pem"
+          der="$RUNNER_TEMP/request.p7m"
+          plain="$RUNNER_TEMP/request.json"
+          printf '%s\n' "$JOB_DECRYPTION_PRIVATE_KEY" > "$private"
+          chmod 600 "$private"
+          base64 -d "$RUNNER_TEMP/mailbox/request.p7m.b64" > "$der"
+          openssl cms -decrypt -binary -inform DER \
+            -in "$der" \
+            -recip encryption/job-ingress.crt \
+            -inkey "$private" \
+            -out "$plain"
+          python -c \
+            'import json,sys; from video_evidence_ingest.job import validate_job; validate_job(json.load(open(sys.argv[1])), sys.argv[2]); print("job envelope validated")' \
+            "$plain" "$JOB_REF"
+
+      - name: Run bounded end-to-end fixture
+        id: ingest
+        continue-on-error: true
+        shell: bash
+        env:
+          JOB_REF: ${{ steps.job.outputs.job_ref }}
+          POT_PROVIDER_HOME: ${{ runner.temp }}/pot-provider/server
+        run: |
+          set +x
+          set +e
+          mkdir -p "$RUNNER_TEMP/mailbox/result"
+          python -c \
+            'import sys; from pathlib import Path; from video_evidence_ingest.job import execute_job; raise SystemExit(execute_job(Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3]), Path(sys.argv[4])))' \
+            "$RUNNER_TEMP/request.json" \
+            "$JOB_REF" \
+            "$RUNNER_TEMP/work" \
+            "$RUNNER_TEMP/mailbox/result"
+          code=$?
+          printf 'exit_code=%s\n' "$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+
+      - name: Return encrypted evidence to isolated job branch
+        if: ${{ always() }}
+        shell: bash
+        env:
+          JOB_REF: ${{ steps.job.outputs.job_ref }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          mailbox="$RUNNER_TEMP/mailbox"
+          if [ ! -d "$mailbox/.git" ] || [ ! -f "$mailbox/result/manifest.json" ]; then
+            echo 'no encrypted result available; return skipped'
+            exit 0
+          fi
+          key="$RUNNER_TEMP/mailbox_key"
+          known="$RUNNER_TEMP/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o UserKnownHostsFile=$known -o StrictHostKeyChecking=yes"
+          cd "$mailbox"
+          git config user.name "video-evidence-ingest"
+          git config user.email "video-evidence-ingest@users.noreply.github.com"
+          git add result
+          git commit --quiet -m "return opaque job result"
+          if ! git push --quiet origin "HEAD:job/$JOB_REF" \
+            >"$RUNNER_TEMP/mailbox-push.log" 2>&1; then
+            echo 'encrypted result return failed'
+            exit 1
+          fi
+          rm -f "$RUNNER_TEMP/request.json" "$RUNNER_TEMP/request.p7m" \
+            "$RUNNER_TEMP/job_key.pem" "$RUNNER_TEMP/mailbox_key"
+
+      - name: Fail if fixture failed
+        if: ${{ always() && steps.ingest.outputs.exit_code != '0' }}
+        shell: bash
+        run: |
+          echo 'bounded end-to-end fixture failed; encrypted diagnostic returned'
+          exit 1

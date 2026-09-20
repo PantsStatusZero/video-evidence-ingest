@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video-evidence-ingest"
+version = "0.2.0"
+description = "Reproducible video evidence ingestion and provenance tooling"
+requires-python = ">=3.11"
+dependencies = [
+  "cryptography>=46,<47",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
