@@ -1,0 +1,246 @@
+name: youtube-acquisition-matrix
+
+on:
+  push:
+    branches:
+      - experiments/youtube-acq-matrix-20260921
+    paths:
+      - '.github/workflows/youtube-acq-matrix.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      TARGET_URL: https://www.youtube.com/watch?v=9JgTVFnIp2Q
+      VIDEO_ID: 9JgTVFnIp2Q
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Environment
+        shell: bash
+        run: |
+          set -u
+          echo "OS=$(uname -a)"
+          echo "PYTHON=$(python --version)"
+          echo "NODE=$(node --version)"
+          CHROME="$(command -v google-chrome-stable || command -v google-chrome || command -v chromium || true)"
+          echo "CHROME=$CHROME"
+          if [ -n "$CHROME" ]; then "$CHROME" --version || true; fi
+          command -v xvfb-run || true
+          ffmpeg -version | head -n 1 || true
+
+      - name: Run acquisition matrix
+        shell: bash
+        run: |
+          set +e
+          RESULTS="$RUNNER_TEMP/results.txt"
+          : > "$RESULTS"
+
+          record() {
+            tool="$1"; state="$2"; detail="$3"
+            detail="$(printf '%s' "$detail" | tr '\n' ' ' | tr '|' '/')"
+            printf 'RESULT|%s|%s|%s\n' "$tool" "$state" "$detail" | tee -a "$RESULTS"
+          }
+
+          classify_log() {
+            tool="$1"; code="$2"; file="$3"
+            if grep -Eqi "Sign in to confirm|not a bot|confirm you.?re not a bot" "$file"; then
+              record "$tool" "PROVIDER_BLOCK" "exit=$code $(tail -c 1200 "$file")"
+            elif [ "$code" -eq 0 ]; then
+              record "$tool" "COMMAND_PASS" "exit=0 $(tail -c 1200 "$file")"
+            else
+              record "$tool" "FAILED" "exit=$code $(tail -c 1200 "$file")"
+            fi
+          }
+
+          CHROME="$(command -v google-chrome-stable || command -v google-chrome || command -v chromium || true)"
+
+          echo "=== youtube-transcript-api ==="
+          python -m venv "$RUNNER_TEMP/venv-ytt"
+          "$RUNNER_TEMP/venv-ytt/bin/pip" -q install -U pip youtube-transcript-api
+          timeout 90 "$RUNNER_TEMP/venv-ytt/bin/python" - <<'PY' >"$RUNNER_TEMP/ytt.log" 2>&1
+          import os
+          from youtube_transcript_api import YouTubeTranscriptApi
+          vid=os.environ["VIDEO_ID"]
+          try:
+              x=YouTubeTranscriptApi().fetch(vid)
+              print("TRANSCRIPT_PASS", "snippets="+str(len(x)), "language="+str(x.language), "generated="+str(x.is_generated))
+              for s in list(x)[:3]:
+                  print(round(s.start,3), s.text[:160])
+          except Exception as e:
+              print("TRANSCRIPT_ERROR", type(e).__name__, repr(e))
+              raise
+          PY
+          classify_log "youtube-transcript-api" "$?" "$RUNNER_TEMP/ytt.log"
+
+          echo "=== pytubefix ==="
+          python -m venv "$RUNNER_TEMP/venv-pytubefix"
+          "$RUNNER_TEMP/venv-pytubefix/bin/pip" -q install -U pip pytubefix
+          timeout 90 "$RUNNER_TEMP/venv-pytubefix/bin/python" - <<'PY' >"$RUNNER_TEMP/pytubefix.log" 2>&1
+          import os
+          from pytubefix import YouTube
+          yt=YouTube(os.environ["TARGET_URL"])
+          print("META", yt.title, yt.author, yt.length)
+          streams=list(yt.streams)
+          print("STREAMS", len(streams))
+          print("CAPTIONS", list(yt.captions.keys()))
+          PY
+          classify_log "pytubefix" "$?" "$RUNNER_TEMP/pytubefix.log"
+
+          echo "=== yt-dlp baseline ==="
+          python -m venv "$RUNNER_TEMP/venv-ytdlp"
+          "$RUNNER_TEMP/venv-ytdlp/bin/pip" -q install -U pip 'yt-dlp[default]'
+          timeout 120 "$RUNNER_TEMP/venv-ytdlp/bin/yt-dlp" -v --skip-download --print '%(title)s|%(channel)s|%(duration_string)s' "$TARGET_URL" >"$RUNNER_TEMP/ytdlp.log" 2>&1
+          classify_log "yt-dlp" "$?" "$RUNNER_TEMP/ytdlp.log"
+
+          echo "=== yt-dlp + WPC browser POT provider ==="
+          "$RUNNER_TEMP/venv-ytdlp/bin/pip" -q install -U yt-dlp-getpot-wpc
+          if [ -n "$CHROME" ]; then
+            timeout 150 xvfb-run -a "$RUNNER_TEMP/venv-ytdlp/bin/yt-dlp" -v --skip-download \
+              --extractor-args "youtube:player_client=web;youtubepot-wpc:browser_path=$CHROME" \
+              --print '%(title)s|%(channel)s|%(duration_string)s' "$TARGET_URL" >"$RUNNER_TEMP/wpc.log" 2>&1
+            classify_log "yt-dlp-getpot-wpc" "$?" "$RUNNER_TEMP/wpc.log"
+          else
+            record "yt-dlp-getpot-wpc" "RUNTIME_GAP" "Chrome/Chromium not installed"
+          fi
+
+          echo "=== YouTube.js / InnerTube ==="
+          mkdir -p "$RUNNER_TEMP/ytjs" && cd "$RUNNER_TEMP/ytjs"
+          npm init -y >/dev/null 2>&1
+          npm install --silent youtubei.js@latest
+          cat > test.mjs <<'JS'
+          import { Innertube } from 'youtubei.js';
+          const vid=process.env.VIDEO_ID;
+          try {
+            const yt=await Innertube.create();
+            const info=await yt.getInfo(vid);
+            console.log('META', info.basic_info?.title, info.basic_info?.author, info.basic_info?.duration);
+            try {
+              const tr=await info.getTranscript();
+              const n=tr?.transcript?.content?.body?.initial_segments?.length ?? 0;
+              console.log('TRANSCRIPT_PASS', n, tr?.selectedLanguage);
+            } catch (e) {
+              console.log('TRANSCRIPT_ERROR', e?.name, e?.message);
+            }
+          } catch (e) {
+            console.log('INFO_ERROR', e?.name, e?.message);
+            process.exitCode=1;
+          }
+          JS
+          timeout 90 node test.mjs >"$RUNNER_TEMP/ytjs.log" 2>&1
+          classify_log "YouTube.js" "$?" "$RUNNER_TEMP/ytjs.log"
+          cd "$GITHUB_WORKSPACE"
+
+          echo "=== raw Chrome headless ==="
+          if [ -n "$CHROME" ]; then
+            timeout 75 "$CHROME" --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage \
+              --virtual-time-budget=15000 --dump-dom "$TARGET_URL" >"$RUNNER_TEMP/chrome-dom.html" 2>"$RUNNER_TEMP/chrome.log"
+            c=$?
+            bytes="$(wc -c < "$RUNNER_TEMP/chrome-dom.html" 2>/dev/null || echo 0)"
+            if grep -Eqi "Sign in to confirm|not a bot|confirm you.?re not a bot" "$RUNNER_TEMP/chrome-dom.html" "$RUNNER_TEMP/chrome.log"; then
+              record "chrome-headless" "PROVIDER_BLOCK" "exit=$c dom_bytes=$bytes"
+            elif [ "$c" -eq 0 ] && [ "$bytes" -gt 10000 ]; then
+              player="$(grep -Eoc 'movie_player|<video' "$RUNNER_TEMP/chrome-dom.html" || true)"
+              record "chrome-headless" "PAGE_PASS" "exit=0 dom_bytes=$bytes player_markers=$player"
+            else
+              record "chrome-headless" "FAILED" "exit=$c dom_bytes=$bytes $(tail -c 700 "$RUNNER_TEMP/chrome.log")"
+            fi
+          else
+            record "chrome-headless" "RUNTIME_GAP" "Chrome/Chromium not installed"
+          fi
+
+          echo "=== Playwright with system Chrome ==="
+          mkdir -p "$RUNNER_TEMP/pw" && cd "$RUNNER_TEMP/pw"
+          npm init -y >/dev/null 2>&1
+          npm install --silent playwright-core@latest
+          cat > test.mjs <<'JS'
+          import { chromium } from 'playwright-core';
+          const exe=process.env.CHROME_BIN;
+          const url=process.env.TARGET_URL;
+          const browser=await chromium.launch({headless:true, executablePath:exe, args:['--no-sandbox','--disable-dev-shm-usage']});
+          const page=await browser.newPage();
+          try {
+            await page.goto(url,{waitUntil:'domcontentloaded',timeout:60000});
+            await page.waitForTimeout(8000);
+            const title=await page.title();
+            const body=(await page.locator('body').innerText({timeout:10000})).slice(0,4000);
+            const players=await page.locator('#movie_player, video').count();
+            console.log('TITLE', title);
+            console.log('PLAYERS', players);
+            console.log('BLOCK', /Sign in to confirm|not a bot|confirm you.?re not a bot/i.test(body));
+            console.log('BODY', body.slice(0,800).replace(/\s+/g,' '));
+            if (players > 0 && !/Sign in to confirm|not a bot/i.test(body)) console.log('PAGE_PASS');
+          } finally {
+            await browser.close();
+          }
+          JS
+          if [ -n "$CHROME" ]; then
+            CHROME_BIN="$CHROME" timeout 90 node test.mjs >"$RUNNER_TEMP/pw.log" 2>&1
+            classify_log "playwright-system-chrome" "$?" "$RUNNER_TEMP/pw.log"
+          else
+            record "playwright-system-chrome" "RUNTIME_GAP" "Chrome/Chromium not installed"
+          fi
+          cd "$GITHUB_WORKSPACE"
+
+          echo "=== nodriver + Xvfb + system Chrome ==="
+          python -m venv "$RUNNER_TEMP/venv-nodriver"
+          "$RUNNER_TEMP/venv-nodriver/bin/pip" -q install -U pip nodriver
+          cat > "$RUNNER_TEMP/nodriver_test.py" <<'PY'
+          import os, shutil
+          import nodriver as uc
+          async def main():
+              chrome=os.environ["CHROME_BIN"]
+              browser=await uc.start(headless=False, browser_executable_path=chrome, browser_args=['--no-sandbox','--disable-dev-shm-usage'])
+              try:
+                  page=await browser.get(os.environ["TARGET_URL"])
+                  await page.sleep(8)
+                  html=await page.get_content()
+                  print("HTML_BYTES", len(html))
+                  print("BLOCK", any(x.lower() in html.lower() for x in ["Sign in to confirm", "not a bot"]))
+                  print("PLAYER", ("movie_player" in html) or ("<video" in html))
+                  print(html[:800].replace("\n"," "))
+              finally:
+                  browser.stop()
+          uc.loop().run_until_complete(main())
+          PY
+          if [ -n "$CHROME" ]; then
+            CHROME_BIN="$CHROME" timeout 120 xvfb-run -a "$RUNNER_TEMP/venv-nodriver/bin/python" "$RUNNER_TEMP/nodriver_test.py" >"$RUNNER_TEMP/nodriver.log" 2>&1
+            classify_log "nodriver" "$?" "$RUNNER_TEMP/nodriver.log"
+          else
+            record "nodriver" "RUNTIME_GAP" "Chrome/Chromium not installed"
+          fi
+
+          echo "=== SeleniumBase UC + Xvfb ==="
+          python -m venv "$RUNNER_TEMP/venv-sb"
+          "$RUNNER_TEMP/venv-sb/bin/pip" -q install -U pip seleniumbase
+          cat > "$RUNNER_TEMP/sb_test.py" <<'PY'
+          import os
+          from seleniumbase import SB
+          with SB(uc=True, headed=True, test=True, locale="en") as sb:
+              sb.open(os.environ["TARGET_URL"])
+              sb.sleep(8)
+              title=sb.get_title()
+              html=sb.get_page_source()
+              print("TITLE", title)
+              print("HTML_BYTES", len(html))
+              print("BLOCK", any(x.lower() in html.lower() for x in ["Sign in to confirm", "not a bot"]))
+              print("PLAYER", ("movie_player" in html) or ("<video" in html))
+              print(html[:800].replace("\n"," "))
+          PY
+          timeout 150 xvfb-run -a "$RUNNER_TEMP/venv-sb/bin/python" "$RUNNER_TEMP/sb_test.py" >"$RUNNER_TEMP/sb.log" 2>&1
+          classify_log "seleniumbase-uc" "$?" "$RUNNER_TEMP/sb.log"
+
+          echo "=== FINAL RESULTS ==="
+          cat "$RESULTS"
