@@ -1,0 +1,70 @@
+name: youtube-acquisition-matrix-wave6
+
+on:
+  push:
+    branches:
+      - experiments/youtube-acq-matrix-20260921
+    paths:
+      - '.github/workflows/youtube-acq-matrix-wave6.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  embed-playback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VIDEO_ID: 9JgTVFnIp2Q
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test actual embedded playback
+        shell: bash
+        run: |
+          set +e
+          CHROME="$(command -v google-chrome-stable || command -v google-chrome || command -v chromium || true)"
+          mkdir -p "$RUNNER_TEMP/pw" && cd "$RUNNER_TEMP/pw"
+          npm init -y >/dev/null 2>&1
+          npm install --silent playwright-core@latest
+          cat > test.mjs <<'JS'
+          import { chromium } from 'playwright-core';
+          const exe=process.env.CHROME_BIN;
+          const vid=process.env.VIDEO_ID;
+          for (const host of ['www.youtube.com','www.youtube-nocookie.com']) {
+            const url=`https://${host}/embed/${vid}?autoplay=1&mute=1`;
+            const browser=await chromium.launch({headless:true,executablePath:exe,args:['--no-sandbox','--disable-dev-shm-usage','--autoplay-policy=no-user-gesture-required']});
+            const page=await browser.newPage();
+            const events=[];
+            page.on('response', async r => {
+              const u=r.url();
+              if (/youtubei\/v1\/player|googlevideo\.com\/videoplayback|youtubei\/v1\/next/.test(u)) {
+                events.push({status:r.status(),url:u.slice(0,180)});
+              }
+            });
+            try {
+              await page.goto(url,{waitUntil:'domcontentloaded',timeout:60000});
+              await page.waitForTimeout(10000);
+              const body=(await page.locator('body').innerText().catch(()=>'' )).slice(0,3000);
+              const videoCount=await page.locator('video').count();
+              let s1={};
+              if(videoCount){
+                s1=await page.locator('video').first().evaluate(v=>({readyState:v.readyState,networkState:v.networkState,paused:v.paused,currentTime:v.currentTime,duration:v.duration,error:v.error&&{code:v.error.code,message:v.error.message}}));
+                await page.locator('video').first().evaluate(v=>v.play().catch(()=>{}));
+                await page.waitForTimeout(8000);
+              }
+              let s2={};
+              if(videoCount){
+                s2=await page.locator('video').first().evaluate(v=>({readyState:v.readyState,networkState:v.networkState,paused:v.paused,currentTime:v.currentTime,duration:v.duration,error:v.error&&{code:v.error.code,message:v.error.message}}));
+              }
+              console.log('RESULT',host,JSON.stringify({
+                title:await page.title(), block:/sign in to confirm|not a bot/i.test(body),
+                videoCount,before:s1,after:s2,events:events.slice(-20)
+              }));
+            } catch(e) {
+              console.log('RESULT',host,JSON.stringify({error:e.name+': '+e.message,events:events.slice(-20)}));
+            } finally { await browser.close(); }
+          }
+          JS
+          CHROME_BIN="$CHROME" timeout 180 node test.mjs
