@@ -1,0 +1,68 @@
+name: youtube-acquisition-matrix-wave4
+
+on:
+  push:
+    branches:
+      - experiments/youtube-acq-matrix-20260921
+    paths:
+      - '.github/workflows/youtube-acq-matrix-wave4.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  client-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TARGET_URL: https://www.youtube.com/watch?v=9JgTVFnIp2Q
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: yt-dlp client matrix
+        shell: bash
+        run: |
+          set +e
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" -q install -U pip 'yt-dlp[default]'
+          ytdlp="$RUNNER_TEMP/venv/bin/yt-dlp"
+          for client in web web_safari web_embedded mweb ios visionos android android_vr tv tv_downgraded tv_simply; do
+            log="$RUNNER_TEMP/$client.log"
+            timeout 60 "$ytdlp" --skip-download --no-warnings \
+              --extractor-args "youtube:player_client=$client" \
+              --print "%(title)s|%(channel)s|%(duration_string)s" "$TARGET_URL" >"$log" 2>&1
+            code=$?
+            if [ "$code" -eq 0 ]; then
+              echo "RESULT|yt-dlp:$client|PASS|$(tail -c 1000 "$log" | tr '\n' ' ')"
+            elif grep -Eqi "Sign in to confirm|not a bot|LOGIN_REQUIRED" "$log"; then
+              echo "RESULT|yt-dlp:$client|PROVIDER_BLOCK|$(tail -c 1000 "$log" | tr '\n' ' ')"
+            else
+              echo "RESULT|yt-dlp:$client|FAILED|exit=$code $(tail -c 1000 "$log" | tr '\n' ' ')"
+            fi
+          done
+
+      - name: Embed surface matrix
+        shell: bash
+        run: |
+          set +e
+          CHROME="$(command -v google-chrome-stable || command -v google-chrome || command -v chromium || true)"
+          for url in \
+            "https://www.youtube.com/embed/9JgTVFnIp2Q" \
+            "https://www.youtube-nocookie.com/embed/9JgTVFnIp2Q"; do
+            tag="$(printf '%s' "$url" | sed 's#https://##;s#[/:?=&]#_#g')"
+            out="$RUNNER_TEMP/$tag.html"
+            err="$RUNNER_TEMP/$tag.err"
+            timeout 60 "$CHROME" --headless=new --no-sandbox --disable-dev-shm-usage --virtual-time-budget=10000 --dump-dom "$url" >"$out" 2>"$err"
+            code=$?
+            bytes="$(wc -c <"$out" 2>/dev/null || echo 0)"
+            if grep -Eqi "Sign in to confirm|not a bot" "$out" "$err"; then
+              state=PROVIDER_BLOCK
+            elif [ "$code" -eq 0 ] && grep -Eqi "<video|movie_player|ytInitialPlayerResponse" "$out"; then
+              state=PAGE_PASS
+            else
+              state=FAILED
+            fi
+            title="$(grep -o '<title>[^<]*' "$out" | head -1 | sed 's/<title>//' | head -c 180)"
+            echo "RESULT|embed:$url|$state|exit=$code bytes=$bytes title=$title"
+          done
