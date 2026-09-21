@@ -1,0 +1,100 @@
+name: youtube-acquisition-matrix-wave5
+
+on:
+  push:
+    branches:
+      - experiments/youtube-acq-matrix-20260921
+    paths:
+      - '.github/workflows/youtube-acq-matrix-wave5.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  embed-deep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      VIDEO_ID: 9JgTVFnIp2Q
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Probe embed player response, captions, and media
+        shell: bash
+        run: |
+          set +e
+          CHROME="$(command -v google-chrome-stable || command -v google-chrome || command -v chromium || true)"
+          for host in www.youtube.com www.youtube-nocookie.com; do
+            url="https://$host/embed/$VIDEO_ID"
+            dom="$RUNNER_TEMP/$host.html"
+            timeout 75 "$CHROME" --headless=new --no-sandbox --disable-dev-shm-usage \
+              --virtual-time-budget=12000 --dump-dom "$url" >"$dom" 2>"$RUNNER_TEMP/$host.err"
+            DOM="$dom" HOST="$host" python - <<'PY'
+          import os,re,json,html
+          p=os.environ["DOM"]; host=os.environ["HOST"]
+          raw=open(p,encoding="utf-8",errors="replace").read()
+          print("BEGIN",host,"BYTES",len(raw))
+          low=raw.lower()
+          print("BLOCK", "sign in to confirm" in low or "not a bot" in low)
+          print("MARKERS", "ytInitialPlayerResponse" in raw, "streamingData" in raw, "captionTracks" in raw, "videoDetails" in raw)
+          candidates=[]
+          for pat in [
+              r'ytInitialPlayerResponse\s*=\s*({.+?})\s*;',
+              r'"PLAYER_VARS"\s*:\s*({.+?})\s*,\s*"PLAYER_CONFIG"',
+              r'"playerResponse"\s*:\s*"((?:\\.|[^"\\])*)"',
+          ]:
+              for m in re.finditer(pat,raw,re.S):
+                  candidates.append((pat,m.group(1)))
+                  break
+          print("CANDIDATES",len(candidates))
+          parsed=None
+          for pat,blob in candidates:
+              try:
+                  if pat.startswith('"playerResponse"'):
+                      blob=json.loads('"'+blob+'"')
+                  data=json.loads(blob)
+                  if isinstance(data,dict) and ("playabilityStatus" in data or "videoDetails" in data or "streamingData" in data):
+                      parsed=data; break
+              except Exception as e:
+                  pass
+          if parsed:
+              ps=parsed.get("playabilityStatus") or {}
+              vd=parsed.get("videoDetails") or {}
+              sd=parsed.get("streamingData") or {}
+              caps=(((parsed.get("captions") or {}).get("playerCaptionsTracklistRenderer") or {}).get("captionTracks") or [])
+              print("PLAYABILITY",ps.get("status"),ps.get("reason"))
+              print("TITLE",vd.get("title"))
+              print("AUTHOR",vd.get("author"))
+              print("DURATION",vd.get("lengthSeconds"))
+              print("FORMATS",len(sd.get("formats") or []),"ADAPTIVE",len(sd.get("adaptiveFormats") or []))
+              print("CAPTIONS",len(caps))
+              for i,c in enumerate(caps[:4]):
+                  print("CAPTION",i,c.get("languageCode"),c.get("kind"),(c.get("name") or {}).get("simpleText"),str(c.get("baseUrl"))[:260])
+              media=(sd.get("formats") or [])+(sd.get("adaptiveFormats") or [])
+              for i,f in enumerate(media[:8]):
+                  print("MEDIA",i,f.get("itag"),f.get("mimeType"),"URL",bool(f.get("url")),"SIG",bool(f.get("signatureCipher") or f.get("cipher")))
+          else:
+              # raw marker context, enough to distinguish escaped/nonstandard embedding
+              for marker in ["streamingData","captionTracks","playabilityStatus","LOGIN_REQUIRED","OK"]:
+                  i=raw.find(marker)
+                  if i>=0:
+                      print("CONTEXT",marker,raw[max(0,i-180):i+500].replace("\n"," ")[:800])
+          print("END",host)
+          PY
+          done
+
+      - name: Direct embed fetch and player API hints
+        shell: bash
+        run: |
+          set +e
+          for host in www.youtube.com www.youtube-nocookie.com; do
+            url="https://$host/embed/$VIDEO_ID"
+            out="$RUNNER_TEMP/curl-$host.html"
+            code="$(curl -L -sS --max-time 30 -o "$out" -w '%{http_code}' "$url")"
+            bytes="$(wc -c <"$out" 2>/dev/null || echo 0)"
+            block=no; grep -Eqi "Sign in to confirm|not a bot" "$out" && block=yes
+            stream=no; grep -q "streamingData" "$out" && stream=yes
+            caps=no; grep -q "captionTracks" "$out" && caps=yes
+            echo "RESULT|curl-embed:$host|http=$code bytes=$bytes block=$block streaming=$stream captions=$caps"
+          done
