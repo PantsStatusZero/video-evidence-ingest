@@ -1,0 +1,95 @@
+name: youtube-acquisition-matrix-wave3
+
+on:
+  push:
+    branches:
+      - experiments/youtube-acq-matrix-20260921
+    paths:
+      - '.github/workflows/youtube-acq-matrix-wave3.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  scrapling-deep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TARGET_URL: https://www.youtube.com/watch?v=9JgTVFnIp2Q
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Scrapling raw body and XHR capture
+        shell: bash
+        run: |
+          set +e
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" -q install -U pip 'scrapling[all]'
+          timeout 360 "$RUNNER_TEMP/venv/bin/scrapling" install --force >"$RUNNER_TEMP/install.log" 2>&1
+          if [ "$?" -ne 0 ]; then
+            echo "RESULT|scrapling-deep|INSTALL_FAILED|$(tail -c 1200 "$RUNNER_TEMP/install.log" | tr '\n' ' ')"
+            exit 0
+          fi
+          cat > "$RUNNER_TEMP/test.py" <<'PY'
+          import os, json, re
+          from scrapling.fetchers import StealthyFetcher
+
+          p=StealthyFetcher.fetch(
+              os.environ["TARGET_URL"],
+              headless=True,
+              network_idle=True,
+              timeout=60000,
+              capture_xhr=r"https://www\.youtube\.com/youtubei/v1/.*",
+          )
+          raw=p.body.decode(p.encoding or "utf-8", errors="replace")
+          low=raw.lower()
+          print("STATUS", p.status)
+          print("RAW_BYTES", len(raw))
+          for marker in ["ytInitialPlayerResponse","streamingData","captionTracks","LOGIN_REQUIRED","Sign in to confirm","not a bot"]:
+              print("MARKER", marker, marker.lower() in low)
+
+          print("XHR_COUNT", len(p.captured_xhr))
+          useful=0
+          for i,x in enumerate(p.captured_xhr):
+              url=getattr(x,"url","")
+              body=x.body.decode(getattr(x,"encoding","utf-8") or "utf-8", errors="replace")
+              if any(k in url for k in ["/player","/next","get_transcript"]):
+                  useful += 1
+                  print("XHR", i, x.status, url, "BYTES", len(body))
+                  try:
+                      data=json.loads(body)
+                      ps=(data.get("playabilityStatus") or {}).get("status")
+                      vd=data.get("videoDetails") or {}
+                      print("XHR_JSON", "status="+str(ps), "title="+str(vd.get("title")), "streaming="+str(bool(data.get("streamingData"))), "captions="+str(bool(data.get("captions"))))
+                      if data.get("captions"):
+                          print("CAPTIONS_KEYS", list((data.get("captions") or {}).keys()))
+                  except Exception as e:
+                      print("XHR_NONJSON", type(e).__name__, body[:300].replace("\n"," "))
+          print("USEFUL_XHR", useful)
+
+          # Try to recover embedded player JSON from raw HTML without relying on DOM text.
+          patterns=[
+              r'ytInitialPlayerResponse\s*=\s*({.+?})\s*;',
+              r'var\s+ytInitialPlayerResponse\s*=\s*({.+?})\s*;',
+          ]
+          found=False
+          for pat in patterns:
+              m=re.search(pat, raw, re.S)
+              if not m: continue
+              found=True
+              blob=m.group(1)
+              print("EMBEDDED_PLAYER_BYTES", len(blob))
+              try:
+                  data=json.loads(blob)
+                  ps=(data.get("playabilityStatus") or {}).get("status")
+                  vd=data.get("videoDetails") or {}
+                  print("EMBEDDED_JSON", "status="+str(ps), "title="+str(vd.get("title")), "streaming="+str(bool(data.get("streamingData"))), "captions="+str(bool(data.get("captions"))))
+              except Exception as e:
+                  print("EMBEDDED_PARSE_ERROR", type(e).__name__, str(e))
+              break
+          print("EMBEDDED_PLAYER_FOUND", found)
+          PY
+          timeout 150 "$RUNNER_TEMP/venv/bin/python" "$RUNNER_TEMP/test.py" >"$RUNNER_TEMP/run.log" 2>&1
+          code=$?
+          echo "RESULT|scrapling-deep|exit=$code|$(tail -c 6000 "$RUNNER_TEMP/run.log" | tr '\n' ' ')"
