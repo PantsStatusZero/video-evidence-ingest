@@ -1,0 +1,186 @@
+name: youtube-acquisition-matrix-wave2
+
+on:
+  push:
+    branches:
+      - experiments/youtube-acq-matrix-20260921
+    paths:
+      - '.github/workflows/youtube-acq-matrix-wave2.yml'
+
+permissions:
+  contents: read
+
+env:
+  TARGET_URL: https://www.youtube.com/watch?v=9JgTVFnIp2Q
+  VIDEO_ID: 9JgTVFnIp2Q
+
+jobs:
+  alternate-clients:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Nodriver fixed + alternative frontend APIs
+        shell: bash
+        run: |
+          set +e
+          record(){ printf 'RESULT|%s|%s|%s\n' "$1" "$2" "$(printf '%s' "$3" | tr '\n' ' ' | tr '|' '/')" ; }
+          CHROME="$(command -v google-chrome-stable || command -v google-chrome || command -v chromium || true)"
+          echo "CHROME=$CHROME"
+
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" -q install -U pip nodriver
+          cat > "$RUNNER_TEMP/nodriver_test.py" <<'PY'
+          import os
+          import nodriver as uc
+          async def main():
+              browser=await uc.start(
+                  headless=False,
+                  browser_executable_path=os.environ["CHROME_BIN"],
+                  no_sandbox=True,
+                  browser_args=['--disable-dev-shm-usage']
+              )
+              try:
+                  page=await browser.get(os.environ["TARGET_URL"])
+                  await page.sleep(8)
+                  html=await page.get_content()
+                  low=html.lower()
+                  print("HTML_BYTES", len(html))
+                  print("BLOCK", ("sign in to confirm" in low) or ("not a bot" in low))
+                  print("PLAYER", ("movie_player" in html) or ("<video" in low))
+                  print(html[:900].replace("\n"," "))
+              finally:
+                  browser.stop()
+          uc.loop().run_until_complete(main())
+          PY
+          if [ -n "$CHROME" ]; then
+            CHROME_BIN="$CHROME" timeout 120 xvfb-run -a "$RUNNER_TEMP/venv/bin/python" "$RUNNER_TEMP/nodriver_test.py" >"$RUNNER_TEMP/nodriver.log" 2>&1
+            code=$?
+            if grep -Eqi "Sign in to confirm|not a bot" "$RUNNER_TEMP/nodriver.log"; then
+              record "nodriver-fixed" "PROVIDER_BLOCK" "exit=$code $(tail -c 1000 "$RUNNER_TEMP/nodriver.log")"
+            elif [ "$code" -eq 0 ]; then
+              record "nodriver-fixed" "PAGE_PASS" "$(tail -c 1000 "$RUNNER_TEMP/nodriver.log")"
+            else
+              record "nodriver-fixed" "FAILED" "exit=$code $(tail -c 1000 "$RUNNER_TEMP/nodriver.log")"
+            fi
+          else
+            record "nodriver-fixed" "RUNTIME_GAP" "No Chrome/Chromium"
+          fi
+
+          for base in https://pipedapi.kavin.rocks https://pipedapi.leptons.xyz https://pipedapi.nosebs.ru; do
+            host="$(printf '%s' "$base" | sed 's#https://##')"
+            out="$RUNNER_TEMP/piped-$host.json"
+            code="$(curl -L -sS --max-time 30 -o "$out" -w '%{http_code}' "$base/streams/$VIDEO_ID")"
+            if [ "$code" = "200" ] && jq -e '.title and (.videoStreams|length >= 0)' "$out" >/dev/null 2>&1; then
+              title="$(jq -r '.title' "$out" | head -c 160)"
+              streams="$(jq -r '(.videoStreams // [])|length' "$out")"
+              subs="$(jq -r '(.subtitles // [])|length' "$out")"
+              record "Piped:$host" "API_PASS" "http=200 title=$title streams=$streams subtitles=$subs"
+            else
+              record "Piped:$host" "FAILED" "http=$code $(head -c 500 "$out" 2>/dev/null)"
+            fi
+          done
+
+          for base in https://inv.nadeko.net https://invidious.tiekoetter.com https://yt.chocolatemoo53.com; do
+            host="$(printf '%s' "$base" | sed 's#https://##')"
+            out="$RUNNER_TEMP/inv-$host.json"
+            code="$(curl -L -sS --max-time 30 -o "$out" -w '%{http_code}' "$base/api/v1/videos/$VIDEO_ID")"
+            if [ "$code" = "200" ] && jq -e '.title and .videoId' "$out" >/dev/null 2>&1; then
+              title="$(jq -r '.title' "$out" | head -c 160)"
+              adaptive="$(jq -r '(.adaptiveFormats // [])|length' "$out")"
+              captions="$(jq -r '(.captions // [])|length' "$out")"
+              record "Invidious:$host" "API_PASS" "http=200 title=$title adaptive=$adaptive captions=$captions"
+            else
+              record "Invidious:$host" "FAILED" "http=$code $(head -c 500 "$out" 2>/dev/null)"
+            fi
+          done
+
+  camoufox:
+    needs: alternate-clients
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Camoufox browser test
+        shell: bash
+        run: |
+          set +e
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" -q install -U pip camoufox
+          timeout 360 "$RUNNER_TEMP/venv/bin/python" -m camoufox fetch >"$RUNNER_TEMP/fetch.log" 2>&1
+          fetch_code=$?
+          if [ "$fetch_code" -ne 0 ]; then
+            echo "RESULT|camoufox|INSTALL_FAILED|$(tail -c 1000 "$RUNNER_TEMP/fetch.log" | tr '\n' ' ')"
+            exit 0
+          fi
+          cat > "$RUNNER_TEMP/test.py" <<'PY'
+          import os
+          from camoufox.sync_api import Camoufox
+          with Camoufox(headless=True) as browser:
+              page=browser.new_page()
+              page.goto(os.environ["TARGET_URL"], wait_until="domcontentloaded", timeout=60000)
+              page.wait_for_timeout(8000)
+              title=page.title()
+              body=page.locator("body").inner_text(timeout=10000)
+              html=page.content()
+              print("TITLE", title)
+              print("HTML_BYTES", len(html))
+              print("BLOCK", ("sign in to confirm" in body.lower()) or ("not a bot" in body.lower()))
+              print("PLAYER", page.locator("#movie_player, video").count())
+              print("BODY", body[:900].replace("\n"," "))
+          PY
+          timeout 120 "$RUNNER_TEMP/venv/bin/python" "$RUNNER_TEMP/test.py" >"$RUNNER_TEMP/run.log" 2>&1
+          code=$?
+          if grep -Eqi "BLOCK True|Sign in to confirm|not a bot" "$RUNNER_TEMP/run.log"; then
+            echo "RESULT|camoufox|PROVIDER_BLOCK|exit=$code $(tail -c 1300 "$RUNNER_TEMP/run.log" | tr '\n' ' ')"
+          elif [ "$code" -eq 0 ]; then
+            echo "RESULT|camoufox|PAGE_PASS|$(tail -c 1300 "$RUNNER_TEMP/run.log" | tr '\n' ' ')"
+          else
+            echo "RESULT|camoufox|FAILED|exit=$code $(tail -c 1300 "$RUNNER_TEMP/run.log" | tr '\n' ' ')"
+          fi
+
+  scrapling:
+    needs: camoufox
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Scrapling StealthyFetcher test
+        shell: bash
+        run: |
+          set +e
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" -q install -U pip 'scrapling[all]'
+          timeout 360 "$RUNNER_TEMP/venv/bin/scrapling" install --force >"$RUNNER_TEMP/install.log" 2>&1
+          install_code=$?
+          if [ "$install_code" -ne 0 ]; then
+            echo "RESULT|scrapling-stealthy|INSTALL_FAILED|$(tail -c 1200 "$RUNNER_TEMP/install.log" | tr '\n' ' ')"
+            exit 0
+          fi
+          cat > "$RUNNER_TEMP/test.py" <<'PY'
+          import os
+          from scrapling.fetchers import StealthyFetcher
+          p=StealthyFetcher.fetch(os.environ["TARGET_URL"], headless=True, network_idle=True, timeout=60000)
+          text=p.text or ""
+          low=text.lower()
+          print("STATUS", p.status)
+          print("TEXT_BYTES", len(text))
+          print("BLOCK", ("sign in to confirm" in low) or ("not a bot" in low))
+          print("TITLE", (p.css("title::text").get() or "")[:300])
+          print("TEXT", text[:900].replace("\n"," "))
+          PY
+          timeout 120 "$RUNNER_TEMP/venv/bin/python" "$RUNNER_TEMP/test.py" >"$RUNNER_TEMP/run.log" 2>&1
+          code=$?
+          if grep -Eqi "BLOCK True|Sign in to confirm|not a bot" "$RUNNER_TEMP/run.log"; then
+            echo "RESULT|scrapling-stealthy|PROVIDER_BLOCK|exit=$code $(tail -c 1300 "$RUNNER_TEMP/run.log" | tr '\n' ' ')"
+          elif [ "$code" -eq 0 ]; then
+            echo "RESULT|scrapling-stealthy|PAGE_PASS|$(tail -c 1300 "$RUNNER_TEMP/run.log" | tr '\n' ' ')"
+          else
+            echo "RESULT|scrapling-stealthy|FAILED|exit=$code $(tail -c 1300 "$RUNNER_TEMP/run.log" | tr '\n' ' ')"
+          fi
