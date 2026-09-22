@@ -1,0 +1,83 @@
+name: latticemere-maint-bootstrap
+run-name: latticemere-maint-bootstrap
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.latticemere-maint/bootstrap-trigger.txt'
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    environment: e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+
+      - name: Build node-encrypted mailbox bootstrap
+        shell: bash
+        env:
+          MAILBOX_DEPLOY_KEY: ${{ secrets.MAILBOX_DEPLOY_KEY }}
+          MAILBOX_SSH_URL: ${{ secrets.MAILBOX_SSH_URL }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          cat > "$work/node.crt.pem" <<'CERT'
+-----BEGIN CERTIFICATE-----
+MIIEHTCCAoWgAwIBAgIUCz5hwHSe5ijj+3sFqrcrS1c80PswDQYJKoZIhvcNAQEL
+BQAwHjEcMBoGA1UEAwwTTEFUVC1OT0RFLTAwMS1NQUlOVDAeFw0yNjA5MjIwNjA1
+MDdaFw0zNjA5MTkwNjA1MDdaMB4xHDAaBgNVBAMME0xBVFQtTk9ERS0wMDEtTUFJ
+TlQwggGiMA0GCSqGSIb3DQEBAQUAA4IBjwAwggGKAoIBgQCjvAxMCIuzDsLVHPnC
+QUtbnLrW3wl6C0ML20DrOrEuncpHyNFmBSRIPJ7y6tnAtS8wIWYxsLDJ4vYPovNJ
+YFX+NrQPaoH+BqGCkV+Z7gm2Mk1m7TovW+t5b0yhi3TnXpMjJWIypZxFRhUaxZhR
+BTV9bxgQ/5X6xyEIc7StGOJc3Bq3SCPvBhCLMXq/tQeAMta19NVpZ5jm/Y9tGXN+
+sLBmk4HF/WcwTPvzmjs69bJmkVf6pv62240ysVB903WH7n4MZvlJ/SLLgBnMY92l
+nfeRGRcyRjSa6jxyjQL3jSHeEQN2Z/eCk74PnABgogmVzYljGswcVHx7jxYecxuD
+YJ1P4uCCzR2hz1JGP/F26seXdnnzrfkECXsptewyMMMxFGxz+yXXM4ue79M1vLp7
+6g1MgC0/1ONqmp/yX3FDf7L4jYGjQAroH8KE5vJ7m0hh7+nyg/DcdQsqitXuoHNv
+IhwDMsFM1tWZppT/dGaKFaYb+e91XFQBEkvMLyJ5Py88SVkCAwEAAaNTMFEwHQYD
+VR0OBBYEFGsnDQEJiqAsWRlMyI2HMZsC+xd1MB8GA1UdIwQYMBaAFGsnDQEJiqAs
+WRlMyI2HMZsC+xd1MA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggGB
+AEnONNQiYpfoEbZH57B5r7g+gaCGrIYI7sVsdGtlj/8GpvIby9o/jocJEA9770Py
+R6UNAusQNsoeSXm7mtNSG3HBFYY/xl5x6EsoJvCnhDOD6A05i/EEbS3dVwHBkcFu
+BSse2BDykE3PNADNQWpl6IxsdZP0bf4KiExJem2tBywqQgdS5uAor6lVXItxnOfx
+WGoN+q7fdbyPagwQkbfxi5YdVd0HZbKM/sHDPUhOcjWMb/KtSLWC5BNMa6y6rViy
+5Q2ZLdaFLpcH6O3J6fdtpwkk30lfB9BwDM3qo4DoUPBz+APbBxoYuIXvSzz6UV9e
+cAVeT8Rm868AYo819PwzEwiritKtnhQsspY4GqCxHH4YAIBym+6x9SB6WU+t/Ou6
+nic9UDyB0p+fsvDEBufqto3zRxbM7YLK17m03DxlewQGMZbOU5YUpy0Xw2Bw8N4k
+55AFunPYMQP6taHBCZggR/xeGyO2oEcG5EMNay3cknJHTouGfxRIcuR75AbJzDt+
+Bg==
+-----END CERTIFICATE-----
+CERT
+          python - <<'PY'
+import json, os, pathlib
+p=pathlib.Path(os.environ["RUNNER_TEMP"])/"latt_mailbox_bootstrap.json"
+p.write_text(json.dumps({
+  "schema":"LATT_MAINT_MAILBOX_BOOTSTRAP/1",
+  "mailbox_ssh_url":os.environ["MAILBOX_SSH_URL"],
+  "mailbox_deploy_key":os.environ["MAILBOX_DEPLOY_KEY"]
+},separators=(",",":")))
+PY
+          openssl cms -encrypt -binary -aes256 -in "$RUNNER_TEMP/latt_mailbox_bootstrap.json" -outform DER -out "$work/bootstrap.p7m" "$work/node.crt.pem"
+          base64 -w 0 "$work/bootstrap.p7m" > "$work/bootstrap.p7m.b64"
+          git fetch origin latticemere-maint-transport
+          git worktree add "$work/transport" origin/latticemere-maint-transport
+          mkdir -p "$work/transport/.latticemere-maint"
+          cp "$work/bootstrap.p7m.b64" "$work/transport/.latticemere-maint/bootstrap.p7m.b64"
+          cd "$work/transport"
+          git config user.name "latticemere-maint-bootstrap"
+          git config user.email "latticemere-maint-bootstrap@users.noreply.github.com"
+          git add .latticemere-maint/bootstrap.p7m.b64
+          git commit -m "Publish node-encrypted Latticemere mailbox bootstrap"
+          git push origin HEAD:latticemere-maint-transport
