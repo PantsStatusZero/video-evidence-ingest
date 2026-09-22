@@ -1,0 +1,73 @@
+name: latticemere-maint-relay
+run-name: latticemere-maint-relay
+
+on:
+  push:
+    branches:
+      - latticemere-maint-transport
+    paths:
+      - '.latticemere-maint/trigger.txt'
+
+permissions:
+  contents: write
+
+jobs:
+  relay:
+    environment: e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout transport branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: latticemere-maint-transport
+          fetch-depth: 1
+
+      - name: Validate opaque job reference
+        id: job
+        shell: bash
+        run: |
+          set -euo pipefail
+          JOB_REF="$(tr -d '\r\n ' < .latticemere-maint/trigger.txt)"
+          if ! printf '%s' "$JOB_REF" | grep -Eq '^[a-f0-9]{32}$'; then
+            echo 'invalid opaque job reference'
+            exit 2
+          fi
+          printf 'job_ref=%s\n' "$JOB_REF" >> "$GITHUB_OUTPUT"
+
+      - name: Read encrypted request from private mailbox
+        shell: bash
+        env:
+          JOB_REF: ${{ steps.job.outputs.job_ref }}
+          MAILBOX_DEPLOY_KEY: ${{ secrets.MAILBOX_DEPLOY_KEY }}
+          MAILBOX_SSH_URL: ${{ secrets.MAILBOX_SSH_URL }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          key="$RUNNER_TEMP/mailbox_key"
+          known="$RUNNER_TEMP/known_hosts"
+          printf '%s\n' "$MAILBOX_DEPLOY_KEY" > "$key"
+          chmod 600 "$key"
+          cat > "$known" <<'KNOWN_HOSTS'
+          github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+          github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoItNistp256AAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+          KNOWN_HOSTS
+          chmod 600 "$known"
+          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o UserKnownHostsFile=$known -o StrictHostKeyChecking=yes"
+          git clone --quiet --single-branch --branch "job/$JOB_REF" "$MAILBOX_SSH_URL" "$RUNNER_TEMP/mailbox"
+          test -f "$RUNNER_TEMP/mailbox/request.p7m.b64"
+          mkdir -p ".latticemere-maint/outbox/$JOB_REF"
+          cp "$RUNNER_TEMP/mailbox/request.p7m.b64" ".latticemere-maint/outbox/$JOB_REF/request.p7m.b64"
+          printf '%s\n' "$JOB_REF" > ".latticemere-maint/current.txt"
+          rm -f "$key"
+
+      - name: Publish encrypted request only
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "latticemere-maint-relay"
+          git config user.email "latticemere-maint-relay@users.noreply.github.com"
+          git add .latticemere-maint/current.txt .latticemere-maint/outbox
+          git commit -m "Relay opaque Latticemere maintenance request" || exit 0
+          git push origin HEAD:latticemere-maint-transport
