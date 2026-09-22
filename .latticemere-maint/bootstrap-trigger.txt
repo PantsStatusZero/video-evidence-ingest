@@ -1,1 +1,2 @@
 LATT-NODE-001
+bootstrap-v2
