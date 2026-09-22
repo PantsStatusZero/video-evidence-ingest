@@ -1,0 +1,84 @@
+name: latticemere-maint-dispatch-v2
+run-name: latticemere-maint-dispatch-v2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.latticemere-dispatch/jobs/*.p7m.b64'
+
+permissions:
+  contents: write
+
+jobs:
+  dispatch:
+    environment: e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+
+      - name: Resolve opaque job carrier
+        id: job
+        shell: bash
+        run: |
+          set -euo pipefail
+          path="$(git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" | grep -E '^\.latticemere-dispatch/jobs/[a-f0-9]{32}\.p7m\.b64$' | head -1)"
+          test -n "$path"
+          ref="$(basename "$path" .p7m.b64)"
+          printf 'job_ref=%s\n' "$ref" >> "$GITHUB_OUTPUT"
+          printf 'request_path=%s\n' "$path" >> "$GITHUB_OUTPUT"
+
+      - name: Relay encrypted request to private mailbox
+        shell: bash
+        env:
+          JOB_REF: ${{ steps.job.outputs.job_ref }}
+          REQUEST_PATH: ${{ steps.job.outputs.request_path }}
+          MAILBOX_DEPLOY_KEY: ${{ secrets.MAILBOX_DEPLOY_KEY }}
+          MAILBOX_SSH_URL: ${{ secrets.MAILBOX_SSH_URL }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          key="$work/key"
+          known="$work/known_hosts"
+          printf '%s\n' "$MAILBOX_DEPLOY_KEY" > "$key"
+          chmod 600 "$key"
+          cat > "$known" <<'KNOWN_HOSTS'
+          github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+          github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoItNistp256AAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+          KNOWN_HOSTS
+          chmod 600 "$known"
+          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o UserKnownHostsFile=$known -o StrictHostKeyChecking=yes"
+          git clone --quiet "$MAILBOX_SSH_URL" "$work/mailbox"
+          cd "$work/mailbox"
+          git checkout -q -b "job/$JOB_REF"
+          cp "$GITHUB_WORKSPACE/$REQUEST_PATH" request.p7m.b64
+          git config user.name "latticemere-maint-dispatch"
+          git config user.email "latticemere-maint-dispatch@users.noreply.github.com"
+          git add request.p7m.b64
+          git commit -q -m "Dispatch opaque Latticemere request"
+          git push --quiet origin "HEAD:refs/heads/job/$JOB_REF"
+
+      - name: Advance opaque current pointer
+        shell: bash
+        env:
+          JOB_REF: ${{ steps.job.outputs.job_ref }}
+        run: |
+          set -euo pipefail
+          git fetch origin latticemere-maint-transport
+          work="$(mktemp -d)"
+          git worktree add -q "$work" origin/latticemere-maint-transport
+          cd "$work"
+          mkdir -p .latticemere-maint
+          printf '%s\n' "$JOB_REF" > .latticemere-maint/current.txt
+          git config user.name "latticemere-maint-dispatch"
+          git config user.email "latticemere-maint-dispatch@users.noreply.github.com"
+          git add .latticemere-maint/current.txt
+          git commit -q -m "Advance opaque Latticemere pointer"
+          git push --quiet origin "HEAD:latticemere-maint-transport"
